@@ -60,6 +60,9 @@ dsh --profile web --dump-config | grep -A3 "id: plan-toggle"
 
 ## 硬拦截（plan 模式下的沙箱只读）
 
+> **只在 `standard`（原生工具）会话可用。PTC 会话里 `Alt+1`/`Alt+2` 会被拒绝并提示新建 standard 会话**——
+> 原因见下文。
+
 官方 plan mode 只是**软提示词**（模型自觉），所以本插件额外把官方**沙箱策略**切到只读。两条官方入口，自动择优：
 
 1. **官方预设（首选）**：`ctx.permissionPresets.set(session, <只读预设>)`。插件在部署的预设表里挑一个
@@ -90,11 +93,48 @@ dsh --profile web --dump-config | grep -A3 "id: plan-toggle"
 - 官方文档明确：`SandboxMode` **只管控文件系统效果**，网络与进程可见性不在定义范围内。
 - 插件自己的归档用 `node:fs`（host 进程写，不经沙箱），因此**不会自锁**。
 
+### 为什么 PTC 会话被拒绝
+
+PTC 把工具**塌缩成 `run_code`**：模型只能直接调它，而它的程序**权限等同 bash、可访问 Node API**
+（官方 `packages/code-runtime/code-runtime-worker-thread/README.zh.md` 明说"隔离措施，而非安全边界"）。
+这意味着 `await import('node:fs')` 可以直接写文件，绕过 `fs-sandbox`（只管 `write`/`edit` 工具）与
+`bash-sandbox`（只管 spawn 出去的进程）；官方 `ctx.tools.restrict()` 又明确**不能**限制 `run_code`
+（`packages/core/tools/src/index.ts:1075`）。所以 PTC 下"写不进文件"我们做不到，就**不假装能**：
+两条快捷键直接拒绝并提示新建 standard 会话（未做任何状态/沙箱改动）。
+
+会话是 standard 还是 PTC 由**会话预设**决定，且**一旦开始对话就锁定**（官方 `agent-preset/locked`），
+不能中途切换 —— 所以选预设要在会话开聊前选好。
+
+### 镜像：用官方入口进 plan 也硬拦
+
+不只 `Alt+1`：用官方 `/plan`、composer 的「Plan ×」徽章、或 `Shift+Tab` 等任何方式进入 plan 模式，
+本插件都会在**下一次工具调用前**把沙箱切到只读；官方退出后自动还原。判定依据是官方 `planMode.get(agent).active`，
+不是本插件自己的状态。
+
+## 配置（可选）
+
+插件行的 `config` 在两个部署相关的选择上有默认值，想改就在 profile 的 `cordis.patch.yml` 里覆盖这一行：
+
+```yaml
+      config:
+        ptcPresets: [ptc]   # 拿不到 ctx.tools 时的兜底判定名单（按会话预设 id 匹配）
+        blockBash: false     # true 时 standard 会话的 plan 模式下连 bash/pwsh 一起拒（含只读命令）
+```
+
+`blockBash` 默认 `false`：沙箱已经挡住了写文件，只读命令（`git status`/`rg`）本就该在 plan 阶段允许；
+打开它则 plan 模式下**所有**命令都被拒，被拒时模型会收到"改用 read/grep/glob"的提示。
+
 ## 已知限制
 
 - **零人工确认**是你的选择：`Alt+2` 之后没有"批准"步骤，只有 `Alt+1` 中止。若模型在规划阶段自行调用官方的
   `exit_plan_mode`，官方「Approve / Keep planning」对话框仍会照常出现（官方行为未改）。
 - 硬拦截的边界见上文「强制力与边界」：只管文件系统写入，不限制网络/进程；工具仍列在工具表里。
+- **PTC 会话完全没有硬拦**（按键被拒并提示切 standard），这是官方信任姿态决定的，不是本插件能修的。
+- **镜像的触发时机是"下一次工具调用"**：官方 `/plan` 之后、下一次工具调用之前沙箱尚未切；但那一次调用
+  本身会在工具体内被新策略拦下，所以不存在"漏一次写"。
+- **插件重载 / `dsh web` 重启会丢失插件的状态（含沙箱还原快照）**，而沙箱覆盖写在会话日志里、跨重启保留：
+  若重启前恰好停在只读态，重启后插件无从得知原预设，再按 `Alt+1` 也救不回来（它会先快照当前（只读）
+  再进入，退出时还原的还是只读）。复位办法：在 Web UI 的权限预设选择器里手动选回原预设。
 - `Alt+2` 需要 agent 空闲（正忙时会被拒绝，等这一轮跑完再按）。
 - 模型"执行中提问后结束轮"也会触发一次执行后自查（用状态门控只注入一次）。
 - 插件重载 / 会话恢复后状态一律回 `normal`。
@@ -113,13 +153,14 @@ dsh --profile web --dump-config | grep -A3 "id: plan-toggle"
 目录：
 
 ```
-lib/index.js    host 半：命令注册 + 流水线编排 + 执行后自查
-lib/state.js    纯逻辑：状态机 / 草稿抽取 / 归档命名 / 复核规格
-lib/archive.js  归档 IO（node:fs）
-lib/sandbox.js  硬拦截闸门（官方预设 C 路线 + setSandboxMode B 路线）
-lib/client.js   browser 半：Alt+1 / Alt+2 键位
-test/           node --test 单测（state / sandbox / host 冒烟 / client 冒烟）
-prd.md          需求文档（含复用映射与取舍）
+lib/index.js         host 半：命令注册 + 流水线编排 + 执行后自查 + 工具闸门（镜像/blockBash）
+lib/state.js         纯逻辑：状态机 / 草稿抽取 / 归档命名 / 复核规格
+lib/archive.js       归档 IO（node:fs）
+lib/sandbox.js       硬拦截闸门（官方预设 C 路线 + setSandboxMode B 路线）
+lib/presentation.js  PTC 判定（run_code 证据 + 预设兜底）
+lib/client.js        browser 半：Alt+1 / Alt+2 键位
+test/                node --test 单测（state / sandbox / presentation / host 冒烟 / client 冒烟）
+prd.md               需求文档（含复用映射与取舍）
 ```
 
 ## 卸载 / 回滚

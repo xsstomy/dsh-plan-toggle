@@ -1,11 +1,13 @@
 /**
  * host 半接线冒烟测试：用假 ctx 驱动 lib/index.js，验证
  *   1) 插件导出（name / inject）符合 cordis 行要求；
- *   2) 两条命令按预期注册；
- *   3) /plan-toggle 真的调用 planMode.set(agent, true/false)，并成对切换硬拦截沙箱；
- *   4) /plan-review 在非 planning 状态下拒绝（不会误触发执行）；
- *   5) **整条流水线的顺序**：复核 → 归档落盘 → 还原沙箱 → 退 plan 模式 → steer 执行
- *      → turn-stopping 注入一次自审。第 5 条是"执行前必须已恢复写权限"的回归。
+ *   2) 两条命令 + 工具闸门按预期注册；
+ *   3) PTC 会话被拒绝（不改模式、不碰沙箱、不动状态），standard 会话正常；
+ *   4) /plan-toggle 真的调用 planMode.set(agent, true/false)，并成对切换硬拦截沙箱；
+ *   5) 镜像：只用官方 plan 模式（不按 Alt+1）也会切/还原只读沙箱；
+ *   6) blockBash 开关只作用于 plan 模式下的 bash/pwsh；
+ *   7) **整条流水线的顺序**：复核 → 归档落盘 → 还原沙箱 → 退 plan 模式 → steer 执行
+ *      → turn-stopping 注入一次自审。第 7 条是"执行前必须已恢复写权限"的回归。
  *
  * 为什么需要它：真实依赖（@deepseek-ai/dsh-llm、@deepseek-ai/dsh-sandbox-policy）
  * 只在 npm install 后才在；缺依赖时本文件整体跳过，保证干净 clone 上 `npm test` 仍可运行。
@@ -55,9 +57,10 @@ function createFakeContext(options = {}) {
   const listeners = new Map()
   const timeline = []
   const effects = []
+  let planActive = options.planActive ?? false
   const session = {
     id: 's1',
-    header: { cwd: options.cwd ?? '/tmp/plan-toggle-smoke' },
+    header: { cwd: options.cwd ?? '/tmp/plan-toggle-smoke', agentPreset: options.preset ?? 'standard' },
     append: (type, data) => timeline.push(`event:${type}:${data.mode ?? ''}`),
   }
   const agent = {
@@ -71,10 +74,17 @@ function createFakeContext(options = {}) {
       serviceFor: (_agent, key) => {
         assert.equal(key, 'planMode')
         return {
-          set: (_target, active) => { timeline.push(`planMode:${active}`); return 'committed' },
+          get: () => ({ active: planActive }),
+          set: (_target, active) => {
+            planActive = active
+            timeline.push(`planMode:${active}`)
+            return 'committed'
+          },
         }
       },
     },
+    // 默认没有 run_code ⇒ standard 会话（PTC 才注入它）；null 表示 tools 服务不存在。
+    tools: options.tools === null ? undefined : (options.tools ?? { get: () => undefined }),
     subagents: {
       getProvider: () => options.provider ?? {
         capabilities: { outputSchema: true },
@@ -121,8 +131,9 @@ function createFakeContext(options = {}) {
     agentPresets: services.agentPresets,
     subagents: services.subagents,
     sessionQuery: services.sessionQuery,
-    // 可选的沙箱/预设/审批服务经软取拿；测试里也可直接改这些属性
+    // 可选的工具/沙箱/预设/审批服务经软取拿；测试里也可直接改这些属性
     get: name => services[name],
+    setPlanActive: value => { planActive = value },
     effect(factory) {
       const disposer = factory()
       effects.push(disposer)
@@ -143,12 +154,24 @@ function createFakeContext(options = {}) {
   return ctx
 }
 
-function attach(ctx) {
+function attach(ctx, config) {
   // attach 只接管 commands 注册表；其余服务保持 ctx 上的属性形态。
   host.apply({
     ...ctx,
     commands: ctx.commandsRegistry,
+  }, config)
+}
+
+/** 触发一次工具闸门；返回 `{decision, nextCalled}`。 */
+async function runToolGate(ctx, name, agent = ctx.agent) {
+  const listener = ctx.listeners.get('tools/pre-execute')
+  assert.ok(listener, 'tools/pre-execute 必须已注册')
+  let nextCalled = false
+  const decision = await listener({ name, arguments: {}, agent }, async () => {
+    nextCalled = true
+    return { kind: 'allow' }
   })
+  return { decision, nextCalled }
 }
 
 test('host 半导出与注入声明', { skip: skipped }, () => {
@@ -157,11 +180,12 @@ test('host 半导出与注入声明', { skip: skipped }, () => {
   assert.equal(typeof host.apply, 'function')
 })
 
-test('注册两条命令与一个 turn-stopping 监听', { skip: skipped }, () => {
+test('注册两条命令、工具闸门与一个 turn-stopping 监听', { skip: skipped }, () => {
   const ctx = createFakeContext()
   attach(ctx)
   assert.deepEqual([...ctx.commands.keys()].sort(), ['plan-review', 'plan-toggle'])
   assert.ok(ctx.listeners.has('agent/turn-stopping'))
+  assert.ok(ctx.listeners.has('tools/pre-execute'))
   assert.equal(ctx.effects.length, 2)
 })
 
@@ -202,6 +226,114 @@ test('/plan-toggle 在 preset 未挂 plan-mode 时明确报错', { skip: skipped
   const result = await ctx.commands.get('plan-toggle').handler({ agent: ctx.agent })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /plan mode/)
+})
+
+test('PTC 会话：两条命令都拒绝，且不改模式、不碰沙箱、不动状态', { skip: skipped }, async () => {
+  const permissionPresets = fakePresets({ current: 'workspace-write' })
+  // ctx.tools 能取到 run_code ⇒ PTC（权威证据）
+  const ctx = createFakeContext({
+    permissionPresets,
+    preset: 'standard',
+    tools: { get: name => (name === 'run_code' ? { name } : undefined) },
+  })
+  attach(ctx)
+  const toggle = await ctx.commands.get('plan-toggle').handler({ agent: ctx.agent })
+  const review = await ctx.commands.get('plan-review').handler({ agent: ctx.agent })
+
+  assert.equal(toggle.kind, 'error')
+  assert.equal(review.kind, 'error')
+  assert.match(toggle.text, /PTC/)
+  assert.match(toggle.text, /standard/)
+  assert.deepEqual(ctx.timeline, [], 'PTC 下不得切 plan 模式、不得碰沙箱')
+  assert.deepEqual(permissionPresets.sets, [])
+  // 状态未被改动：紧接着仍可用官方方式进入（这里以 pre-execute 镜像反证 states 仍 normal）
+  assert.deepEqual(ctx.effects.length, 2)
+})
+
+test('PTC 兜底判定：ctx.tools 缺失但预设 id 命中名单时同样拒绝', { skip: skipped }, async () => {
+  const ctx = createFakeContext({ preset: 'ptc', tools: null })
+  attach(ctx)
+  const result = await ctx.commands.get('plan-toggle').handler({ agent: ctx.agent })
+  assert.equal(result.kind, 'error')
+  assert.match(result.text, /PTC/)
+  assert.deepEqual(ctx.timeline, [])
+})
+
+test('工具闸门：standard 会话下不误拦 write', { skip: skipped }, async () => {
+  const ctx = createFakeContext()
+  attach(ctx)
+  const { decision, nextCalled } = await runToolGate(ctx, 'write')
+  assert.equal(decision.kind, 'allow')
+  assert.equal(nextCalled, true)
+})
+
+test('镜像：只用官方 plan 模式（不按 Alt+1）也会切/还原只读沙箱', { skip: skipped }, async () => {
+  const permissionPresets = fakePresets({ current: 'workspace-write' })
+  const ctx = createFakeContext({ permissionPresets })
+  attach(ctx)
+
+  // 官方 /plan 进入（插件命令没被调用）：下一次工具调用前镜像生效
+  ctx.setPlanActive(true)
+  const first = await runToolGate(ctx, 'read')
+  assert.equal(first.decision.kind, 'allow')
+  assert.deepEqual(permissionPresets.sets, ['read-only'], '官方 /plan 进入后必须切只读')
+
+  // 官方 /plan off：恢复写权限
+  ctx.setPlanActive(false)
+  await runToolGate(ctx, 'read')
+  assert.deepEqual(permissionPresets.sets, ['read-only', 'workspace-write'])
+})
+
+test('镜像：进入官方 plan 模式后 Alt+2 仍可用（状态被镜像成 planning）', { skip: skipped }, async () => {
+  const cwd = await mkdtemp(join(tmpdir(), 'plan-toggle-mirror-'))
+  const permissionPresets = fakePresets({ current: 'workspace-write' })
+  try {
+    const ctx = createFakeContext({ cwd, permissionPresets })
+    attach(ctx)
+    ctx.setPlanActive(true)
+    await runToolGate(ctx, 'read') // 镜像切只读 + 状态转 planning
+
+    const result = await ctx.commands.get('plan-review').handler({ agent: ctx.agent })
+    assert.equal(result.kind, 'success', result.text)
+    assert.ok(ctx.timeline.some(entry => entry.startsWith('steer:')), '镜像进入后 Alt+2 必须能起执行轮')
+    assert.deepEqual(permissionPresets.sets, ['read-only', 'workspace-write'], '执行前必须已还原')
+  } finally {
+    await rm(cwd, { recursive: true, force: true })
+  }
+})
+
+test('blockBash：开启后 plan 模式下 bash/pwsh 被拒，read 仍放行', { skip: skipped }, async () => {
+  const ctx = createFakeContext({ planActive: true })
+  attach(ctx, { blockBash: true })
+
+  const bash = await runToolGate(ctx, 'bash')
+  assert.deepEqual(bash.decision, {
+    kind: 'deny',
+    reason: 'plan 模式禁止执行命令。请改用 read/grep/glob 只读探索，或把方案写进计划后按 Alt+2。',
+  })
+  assert.equal(bash.nextCalled, false, 'deny 时不得继续委派')
+
+  const pwsh = await runToolGate(ctx, 'pwsh')
+  assert.equal(pwsh.decision.kind, 'deny')
+
+  const read = await runToolGate(ctx, 'read')
+  assert.equal(read.decision.kind, 'allow')
+  assert.equal(read.nextCalled, true)
+})
+
+test('blockBash 默认关闭：plan 模式下 bash 放行（沙箱负责挡写）', { skip: skipped }, async () => {
+  const ctx = createFakeContext({ planActive: true })
+  attach(ctx)
+  const bash = await runToolGate(ctx, 'bash')
+  assert.equal(bash.decision.kind, 'allow')
+  assert.equal(bash.nextCalled, true)
+})
+
+test('blockBash 不在 plan 模式下生效', { skip: skipped }, async () => {
+  const ctx = createFakeContext({ planActive: false })
+  attach(ctx, { blockBash: true })
+  const bash = await runToolGate(ctx, 'bash')
+  assert.equal(bash.decision.kind, 'allow')
 })
 
 test('/plan-review 在非 plan 模式下拒绝，且不碰子代理', { skip: skipped }, async () => {

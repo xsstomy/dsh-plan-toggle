@@ -14,6 +14,10 @@
 # 刻意不 inject fs：归档改用 node:fs，避免耦合 fs-sandbox 的 workspace/策略状态。
 #
 # ── 硬拦截（plan 模式下的沙箱只读）────────────────────────────────────────────
+# 本插件只为 standard（原生工具）会话提供硬拦 plan 模式。PTC 会话下两个快捷键会被拒绝并
+# 提示新建 standard 会话：PTC 把工具塌缩成 run_code，其程序权限等同 bash（可 import('node:fs')
+# 绕过 fs/bash 两层沙箱），官方 toolFilter 也明确不能限制 run_code，所以那里写不进文件做不到。
+#
 # 插件在运行时软取三个服务并在进入 plan 模式时把沙箱切到只读：
 #   permissionPresets（C 路线，首选）：挑一个 `sandbox: read-only` 的官方预设并 set()
 #      —— 优先名为 `plan` 的预设，否则用官方自带的 `read-only`；预设表本身由部署方
@@ -24,8 +28,12 @@
 #      的写路径（permission-presets 内部同样调用它）。
 #   approval：离开只读时还原审批策略（进入前不是预设时走直写）。
 # 这三个服务缺失时插件自动降级为官方软提示词拦截，不会启动失败。
+# 镜像：用官方 /plan、UI 徽章等入口进入 plan 模式时，也会在下一次工具调用前自动切/还原。
 
 - insert:
     - id: plan-toggle
       name: dsh-plan-toggle
       inject: [agentPresets, subagents, commands, sessionQuery]
+      config:
+        ptcPresets: [ptc]      # 拿不到 ctx.tools 时的兜底判定名单
+        blockBash: false       # true 时 standard 会话的 plan 模式下连 bash/pwsh 一起拒（含只读命令）
