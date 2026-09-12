@@ -9,7 +9,7 @@
 |---|---|
 | 形态 | 独立仓库 `xsstomy/dsh-plan-toggle`，第三方 **bundle 插件**（host 半 + browser 半），官方源码零改动 |
 | 平台 | **仅 Web profile**（Desktop 暂不做） |
-| 键 1 `Alt+1` | 进/出「plan 模式」（复用官方 plan mode；**软拦截**：只切 plan 状态，不切 sandbox） |
+| 键 1 `Alt+1` | 进/出「plan 模式」（复用官方 plan mode；**硬拦截**：进入时把沙箱切到 `read-only`，退出/执行前自动还原） |
 | 键 2 `Alt+2` | 零人工确认流水线：子代理独立复核 → 修订并归档 → 自动执行 → 执行后自动自查 → 回 normal |
 | 归档 | 插件写 `<会话 cwd>/docs/plans/YYYY-MM-DD-功能名.md`；同名规则见下 |
 | 命名 | 复用官方 plan mode 语义，不另造同名概念 |
@@ -37,6 +37,7 @@ normal ──Alt+1──▶ planning ──Alt+2──▶ reviewing ──(复�
 | plan 模式提示词 | ✅ | 官方 `plan:policy` 段（ptc/standard preset 已挂），插件不改 |
 | 独立复核子代理 | ✅ | `ctx.subagents.start('spawn', { parent, prompt, signal, outputSchema, toolFilter, maxDepth })` → `run.result` / `run.dispose()` |
 | 复核者只读 | ✅ | `toolFilter: { allow: ['read','grep','glob'] }`（工具级消失且拒绝执行；注意：管不到路径，所以归档不交给子代理写） |
+| plan 模式下的**硬拦截**（写入真被拒） | ✅ | 沙箱策略官方入口：C=`ctx.permissionPresets.set(session, <只读预设>)`（优先 `plan` 预设，否则官方自带 `read-only`）；B=`setSandboxMode(session, 'read-only')`（`@deepseek-ai/dsh-sandbox-policy` 导出，permission-presets 内部同款）；还原用 `setSandboxMode` / `approval.setPolicy` |
 | 读计划草稿 | ✅ | `ctx.sessionQuery.readSurface(sessionId).events`（`user/message` / `assistant/message` 的文本） |
 | 注入指令 / 起执行轮 | ✅ | `createUserMessage()`（`@deepseek-ai/dsh-llm`）+ `agent.steer(msg)` |
 | 执行后自动自查 | ✅ | `ctx.on('agent/turn-stopping', …)` + steer（官方 hooks 的 Stop 用的同一 seam） |
@@ -49,7 +50,15 @@ normal ──Alt+1──▶ planning ──Alt+2──▶ reviewing ──(复�
 
 1. **零人工确认**（用户选定）：不依赖 `exit_plan_mode` 审批通道自动批答（waterfall 监听顺序不保证），改用确定性的 `planMode.set(agent, false)`。
    - 副作用：规划阶段模型若自行调用 `exit_plan_mode`，仍会弹出官方「Approve / Keep planning」人工对话框（官方行为原样保留）。
-2. 只读为**软拦截**：只切官方 plan mode，不切 sandbox（`setSandboxMode` 不用）。
+2. **硬拦截用官方沙箱策略**（B + C 两条入口，插件自动择优）：
+   - C（首选）：官方 permission preset。插件在部署预设表里挑一个 `sandbox: read-only` 的项（优先名为 `plan`），
+     `ctx.permissionPresets.set(session, name)` —— UI 选择器会显示该预设，审批策略一并设定；**不覆盖**部署的预设表。
+   - B（兜底）：`setSandboxMode(session, 'read-only')`（官方导出 setter）。
+   - 两者都缺失时自动降级为官方软提示词。
+   - 官方为请求缓存稳定**刻意保持工具表跨模式不变**，所以硬拦截是"写操作被拒（EACCES/EPERM）"，
+     而不是把 write/edit 从工具表摘掉；`SandboxMode` 只管控文件系统效果（网络/进程可见性不在范围）。
+   - **还原是硬要求**：`Alt+1` 退出与 `Alt+2` 执行前都要还原，否则执行轮在只读沙箱下全部失败。
+     插件自己的归档走 `node:fs`（host 进程写），不经沙箱，因此不会自锁。
 3. 执行后**自查一轮**，不循环。
 4. 暂不发 npm，先用 git / 本地路径安装；复核者模型继承父会话路由。
 5. 键位 v1 硬编码 `Alt+1` / `Alt+2`（用 `event.code` 判定，规避 macOS Option 改字符）；改键列为后续项。

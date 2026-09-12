@@ -59,13 +59,18 @@ test('状态机：Alt+2 仅在 planning 且 agent 空闲时可启动', () => {
   assert.equal(canStartReview({ mode: MODE.executing, status: 'idle' }), false)
 })
 
-test('会话状态表：默认 normal，自审标记只生效一次', () => {
+test('会话状态表：默认 normal，门控描述符可取走后清空，自审标记只生效一次', () => {
   const states = createSessionStates()
-  assert.deepEqual(states.get('s1'), { mode: MODE.normal, reviewFired: false })
+  assert.deepEqual(states.get('s1'), { mode: MODE.normal, reviewFired: false, gate: undefined })
+  states.set('s1', MODE.planning, { via: 'setter', saved: { sandbox: 'workspace-write' } })
+  assert.equal(states.get('s1').mode, MODE.planning)
+  assert.equal(states.takeGate('s1').via, 'setter')
+  assert.equal(states.get('s1').gate, undefined, '取走后不得留下重复还原的机会')
+  assert.equal(states.takeGate('s1'), undefined)
   states.set('s1', MODE.executing)
   assert.equal(states.get('s1').mode, MODE.executing)
   states.markReviewFired('s1')
-  assert.deepEqual(states.get('s1'), { mode: MODE.normal, reviewFired: true })
+  assert.deepEqual(states.get('s1'), { mode: MODE.normal, reviewFired: true, gate: undefined })
   states.reset('s1')
   assert.equal(states.size, 0)
 })
