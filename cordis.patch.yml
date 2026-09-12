@@ -1,0 +1,19 @@
+# dsh-plan-toggle bundle patch —— 在 web-app 层之后插入一行 host 插件。
+#
+# 零侵入：不改官方任何文件。本行挂本包的 lib/index.js（package.json 的
+# dsh.bundle.patch 指向本文件），由 dsh plugin --profile web add 自动并入
+# profile 的 bundle 层栈。
+#
+# inject 的四个服务都是 web profile 里未禁用的 host 服务：
+#   agentPresets  -> agent-presets（web-app 层），用来取 agent 自己的 planMode
+#                    （plan-mode 由 preset 挂在 isolate realm，host ctx 取不到）
+#   subagents     -> subagent（base 层）的 spawn provider，跑只读复核子代理
+#   commands      -> commands（base 层），注册 /plan-toggle 与 /plan-review
+#   sessionQuery  -> session-query-sqlite（base 层），读会话 surface 取计划草稿
+#
+# 刻意不 inject fs：归档改用 node:fs，避免耦合 fs-sandbox 的 workspace/策略状态。
+
+- insert:
+    - id: plan-toggle
+      name: dsh-plan-toggle
+      inject: [agentPresets, subagents, commands, sessionQuery]

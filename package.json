@@ -1,0 +1,55 @@
+{
+  "name": "dsh-plan-toggle",
+  "version": "0.1.0",
+  "description": "DSH Web 插件：Alt+1 进/出 plan 模式，Alt+2 一键「子代理复核 → 归档 → 自动执行 → 执行后自查」",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "prd.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  },
+  "dependencies": {
+    "@deepseek-ai/dsh-llm": "^0.1.5-rc.2"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\""
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "deepseek-harness-plugin",
+    "plan-mode",
+    "plan-review",
+    "web-ui"
+  ],
+  "author": "xsstomy",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xsstomy/dsh-plan-toggle.git"
+  }
+}
