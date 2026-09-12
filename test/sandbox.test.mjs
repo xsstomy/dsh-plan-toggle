@@ -123,6 +123,96 @@ test('两者都不可用时闸门不可用，toggle 侧降级为软拦截', () =
   assert.equal(gate.leave(agent, undefined), 'none')
 })
 
+test('回归（线上事故）：重启后采纳官方 plan 态，退出必须还原到部署默认预设，不能还原成只读', () => {
+  // 场景复现（来自真实会话日志）：
+  //   seq 0-2 会话创建 → danger-full-access；seq 4-8 首进 plan → read-only（快照正确）
+  //   seq 41  dsh web 重启（插件内存清空，但日志里沙箱仍是 read-only）→ 镜像采纳该态并切 plan
+  //   seq 50  退出 → 旧实现把"当时看到的 read-only"当成进入前状态 → 永久卡在只读
+  const table = {
+    plan: { sandbox: READ_ONLY_MODE, approval: 'never' },
+    'read-only': { sandbox: READ_ONLY_MODE, approval: 'ask' },
+    'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+    'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+  }
+  const sets = []
+  let current = 'danger-full-access'
+  let sandboxMode = 'danger-full-access'
+  const permissionPresets = {
+    names: Object.keys(table),
+    resolve: name => ({ name, ...table[name] }),
+    current: () => current,
+    defaultPreset: 'danger-full-access',
+    set: (_session, name) => { sets.push(name); current = name; sandboxMode = table[name].sandbox },
+  }
+  const sandboxPolicy = { resolve: () => ({ mode: sandboxMode }), overrideOf: () => undefined }
+  const session = { id: 's1', append: () => {} }
+
+  // 插件重启 ⇒ 新实例，内存里没有任何快照；但会话日志里沙箱仍是只读、当前预设解出 read-only
+  sandboxMode = READ_ONLY_MODE
+  current = 'read-only'
+  const gate = createHardGate({ permissionPresets, sandboxPolicy })
+  const descriptor = gate.enter(session) // 镜像采纳：当前已经是 read-only
+  assert.equal(descriptor.via, 'preset')
+  assert.equal(descriptor.saved.adopted, true, '幂等快照必须被标记为"采纳态"')
+
+  assert.equal(gate.leave({ session }, descriptor), 'preset')
+  assert.deepEqual(sets, ['plan', 'danger-full-access'], '退出必须回到部署默认预设，而不是只读')
+})
+
+test('还原优先级：上次见到的正常预设 > 部署默认预设', () => {
+  const table = {
+    plan: { sandbox: READ_ONLY_MODE, approval: 'never' },
+    'workspace-write': { sandbox: 'workspace-write', approval: 'ask' },
+    'danger-full-access': { sandbox: 'danger-full-access', approval: 'never' },
+  }
+  const sets = []
+  let current = 'workspace-write'
+  let sandboxMode = 'workspace-write'
+  const permissionPresets = {
+    names: Object.keys(table),
+    resolve: name => ({ name, ...table[name] }),
+    current: () => current,
+    defaultPreset: 'danger-full-access',
+    set: (_session, name) => { sets.push(name); current = name; sandboxMode = table[name].sandbox },
+  }
+  const gate = createHardGate({
+    permissionPresets,
+    sandboxPolicy: { resolve: () => ({ mode: sandboxMode }), overrideOf: () => undefined },
+  })
+  const session = { id: 's1', append: () => {} }
+
+  // 正常进出一次：记住 workspace-write
+  const first = gate.enter(session)
+  assert.equal(first.saved.presetName, 'workspace-write')
+  gate.leave({ session }, first)
+  // 再进入时外部已把它改成 plan（例如用户在 UI 里手动切过）→ 快照不可靠
+  current = 'plan'
+  sandboxMode = READ_ONLY_MODE
+  const second = gate.enter(session)
+  assert.equal(second.saved.adopted, true)
+  gate.leave({ session }, second)
+  assert.equal(sets.at(-1), 'workspace-write', '应优先还原上次见到的正常预设，而不是部署默认')
+})
+
+test('无预设服务时：采纳态按部署默认旋钮还原（不把只读留在会话里）', () => {
+  const writes = []
+  const session = { id: 's1', append: (type, data) => writes.push([type, data]) }
+  const gate = createHardGate({
+    // 只有 B 路线：没有 permissionPresets
+    sandboxPolicy: {
+      resolve: request => ({ mode: request === undefined ? 'workspace-write' : READ_ONLY_MODE }),
+      overrideOf: () => undefined,
+    },
+  })
+  const descriptor = gate.enter(session)
+  assert.equal(descriptor.saved.adopted, true)
+  assert.equal(gate.leave({ session }, descriptor), 'setter')
+  assert.deepEqual(writes, [
+    ['sandbox/mode', { mode: READ_ONLY_MODE }],
+    ['sandbox/mode', { mode: 'workspace-write' }],
+  ], '没有预设服务时也要回到部署默认模式')
+})
+
 test('重复离开不叠加副作用：描述符被调用方取走后不会再被还原一次', () => {
   const permissionPresets = fakePresets({
     table: {
