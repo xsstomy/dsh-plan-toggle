@@ -143,7 +143,7 @@ function createFakeContext(options = {}) {
       listeners.set(event, listener)
       return () => listeners.delete(event)
     },
-    logger: { error() {} },
+    logger: { error() {}, info(entry) { timeline.push(`log:${entry}`) } },
   }
   ctx.commandsRegistry = {
     register(definition) {
@@ -244,7 +244,9 @@ test('PTC 会话：两条命令都拒绝，且不改模式、不碰沙箱、不�
   assert.equal(review.kind, 'error')
   assert.match(toggle.text, /PTC/)
   assert.match(toggle.text, /standard/)
-  assert.deepEqual(ctx.timeline, [], 'PTC 下不得切 plan 模式、不得碰沙箱')
+  // 只允许留下带证据的日志：不得切 plan 模式、不得碰沙箱
+  assert.ok(ctx.timeline.length > 0 && ctx.timeline.every(entry => entry.startsWith('log:')), ctx.timeline.join(' | '))
+  assert.match(ctx.timeline.join(' '), /evidence=run_code/)
   assert.deepEqual(permissionPresets.sets, [])
   // 状态未被改动：紧接着仍可用官方方式进入（这里以 pre-execute 镜像反证 states 仍 normal）
   assert.deepEqual(ctx.effects.length, 2)
@@ -256,7 +258,8 @@ test('PTC 兜底判定：ctx.tools 缺失但预设 id 命中名单时同样拒�
   const result = await ctx.commands.get('plan-toggle').handler({ agent: ctx.agent })
   assert.equal(result.kind, 'error')
   assert.match(result.text, /PTC/)
-  assert.deepEqual(ctx.timeline, [])
+  assert.deepEqual(ctx.timeline.length, 1, '兜底路径也应只留一行证据日志')
+  assert.match(ctx.timeline[0], /evidence=preset/, '兜底路径必须记下证据来源')
 })
 
 test('工具闸门：standard 会话下不误拦 write', { skip: skipped }, async () => {
