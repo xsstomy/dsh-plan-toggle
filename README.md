@@ -67,14 +67,22 @@ dsh --profile web --dump-config | grep -A3 "id: plan-toggle"
 
 1. **官方预设（首选）**：`ctx.permissionPresets.set(session, <只读预设>)`。插件在部署的预设表里挑一个
    `sandbox: read-only` 的项，**优先名为 `plan` 的预设**，否则用官方自带的 `read-only`。预设表由部署方拥有，
-   本插件**不覆盖**它；想让它显示成 `plan`，在你自己的 profile patch 里加一项即可：
+   本插件**不覆盖**它。想让它显示成 `plan`，在你自己的 profile patch 里加一项即可：
 
    ```yaml
    - id: permission
      config:
        presets:
-         plan: { sandbox: read-only, approval: ask }
+         # 推荐：拒绝即终局 —— 写操作被沙箱拒后，模型也不能用 sandbox_permissions 申请一次性放宽
+         plan: { sandbox: read-only, approval: never }
+         # 少一道阀：模型可以申请越权，但会弹审批由你逐条批准
+         read-only: { sandbox: read-only, approval: ask }
    ```
+
+   > `presets` 在 patch 里是**整体声明**（不是合并），所以要改就把原有预设一起列出来。
+   > 两种 `approval` 的差别：官方 bash/`write`/`edit` 都支持被拒后带 `sandbox_permissions` 重试并弹审批
+   > （工具描述称"the approval prompt raised by that retry is how the user consents"）；
+   > `approval: never` 时这个通道关闭，官方描述称"denial is final"。
 
 2. **官方 setter（兜底）**：没有只读预设（或没挂 permission-presets）时，调用官方导出的
    `setSandboxMode(session, 'read-only')`（`@deepseek-ai/dsh-sandbox-policy`，permission-presets 内部同样用它）。
